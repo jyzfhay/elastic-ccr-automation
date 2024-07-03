@@ -1,0 +1,14 @@
+{
+  "leader": {
+      "dep_name": "leader-cluster",
+      "elastic_url": "https://leader-cluster.example.com",
+      "elastic_api_key": "leaderApiKey"
+  },
+  "follower": {
+      "dep_name": "follower-cluster",
+      "elastic_url": "https://follower-cluster.example.com",
+      "elastic_api_key": "followerApiKey"
+  },
+  "dry_run": true,
+  "rc_name": "my-remote-cluster"
+}
