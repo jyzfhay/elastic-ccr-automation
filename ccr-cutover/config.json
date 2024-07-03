@@ -1,0 +1,5 @@
+{
+  "es_src_url": "Elasticsearch URL",
+  "api_key": "API Key",
+  "dry_run": true
+}
