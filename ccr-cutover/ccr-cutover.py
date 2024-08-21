@@ -15,6 +15,7 @@ es = Elasticsearch([es_src_url], api_key=api_key)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Test test test
 # Function to identify follower indices
 def get_follower_indices():
     follower_indices = []
