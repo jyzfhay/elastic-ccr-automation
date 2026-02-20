@@ -1,174 +1,215 @@
+#!/usr/bin/env python3
+"""
+Promote CCR follower indices to standalone leaders (pause follow, unfollow, open, allow writes).
+Run: python ccr-cutover.py [config.json]
+"""
+import argparse
 import json
 import logging
+import sys
 import time
 from elasticsearch import Elasticsearch, exceptions
 
-# Load configuration from config.json
-with open('config.json', 'r') as config_file:
-    config = json.load(config_file)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("ccr_cutover")
 
-es_src_url = config['es_src_url']
-api_key = config['api_key']
-dry_run = config.get('dry_run', False)
+PROMOTE_RETRIES = 3
+PROMOTE_DELAY = 5
 
-es = Elasticsearch([es_src_url], api_key=api_key)
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Function to identify follower indices
-def get_follower_indices():
-    follower_indices = []
+def load_config(path: str) -> dict:
+    """Load JSON config. Exits on error."""
     try:
-        ccr_stats = es.ccr.stats()
-        ccr_stats_dict = ccr_stats.body 
-        logging.info(f"CCR Stats: {json.dumps(ccr_stats_dict, indent=2)}") 
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error("Failed to load config %s: %s", path, e)
+        sys.exit(1)
 
-        # Extract follower indices from the CCR stats
-        for follow_stats in ccr_stats_dict.get('follow_stats', {}).get('indices', []):
-            for shard in follow_stats.get('shards', []):
-                follower_index = shard.get('follower_index')
-                if follower_index and follower_index not in follower_indices:
-                    follower_indices.append(follower_index)
+
+def get_follower_indices(es: Elasticsearch) -> list:
+    """Return list of follower index names from CCR stats."""
+    out = []
+    try:
+        resp = es.ccr.stats()
+        body = resp.body if hasattr(resp, "body") else resp
+        for follow_stats in body.get("follow_stats", {}).get("indices", []):
+            for shard in follow_stats.get("shards", []):
+                idx = shard.get("follower_index")
+                if idx and idx not in out:
+                    out.append(idx)
     except exceptions.ConnectionError as e:
-        logging.error(f"Connection error: {e}")
+        logger.error("Connection error: %s", e)
     except exceptions.NotFoundError as e:
-        logging.error(f"Not found error: {e}")
-    except KeyError as e:
-        logging.error(f"Key error: {e}")
-    except Exception as e:
-        logging.error(f"Unexpected error: {e}")
-    return follower_indices
+        logger.error("Not found: %s", e)
+    except (KeyError, Exception) as e:
+        logger.error("Error getting follower indices: %s", e)
+    return out
 
-# Function to check if follower indices are caught up with leader indices
-def validate_follower_indices(follower_indices):
-    caught_up_indices = []
-    not_caught_up_indices = []
+
+def validate_follower_indices(es: Elasticsearch, follower_indices: list) -> tuple:
+    """
+    Check which followers are caught up with their leader.
+    Returns (caught_up_list, not_caught_up_list).
+    """
+    caught_up = []
+    not_caught_up = []
     try:
         for index in follower_indices:
-            stats = es.ccr.follow_info(index=index)
-            stats_dict = stats.body  # Use .body to get the JSON response as a dictionary
-            logging.info(f"Follow info for {index}: {json.dumps(stats_dict, indent=2)}") 
-            follower_indices_info = stats_dict.get('follower_indices', [])
-            for follower in follower_indices_info:
-                follower_index = follower.get('follower_index')
-                if not follower_index:
-                    logging.error(f"No 'follower_index' found in {follower}")
+            resp = es.ccr.follow_info(index=index)
+            body = resp.body if hasattr(resp, "body") else resp
+            for follower in body.get("follower_indices", []):
+                fidx = follower.get("follower_index")
+                if not fidx:
                     continue
-                all_shards_caught_up = True
-                for shard in follower.get('shards', []):
-                    if shard.get('leader_global_checkpoint') != shard.get('follower_global_checkpoint'):
-                        all_shards_caught_up = False
-                        not_caught_up_indices.append(follower_index)
+                all_ok = True
+                for shard in follower.get("shards", []):
+                    if shard.get("leader_global_checkpoint") != shard.get("follower_global_checkpoint"):
+                        all_ok = False
                         break
-                if all_shards_caught_up:
-                    caught_up_indices.append(follower_index)
-    except exceptions.ConnectionError as e:
-        logging.error(f"Connection error: {e}")
-    except exceptions.NotFoundError as e:
-        logging.error(f"Not found error: {e}")
-    except KeyError as e:
-        logging.error(f"Key error: {e}")
-    except Exception as e:
-        logging.error(f"Unexpected error: {e}")
-    return caught_up_indices, not_caught_up_indices
+                if all_ok:
+                    caught_up.append(fidx)
+                else:
+                    not_caught_up.append(fidx)
+    except (exceptions.ConnectionError, exceptions.NotFoundError, KeyError, Exception) as e:
+        logger.error("Error validating followers: %s", e)
+    return caught_up, not_caught_up
 
-# Function to promote a follower index to a leader index
-def promote_follower(index, retries=3, delay=5):
+
+def promote_follower(es: Elasticsearch, index: str, dry_run: bool) -> bool:
+    """Pause follow, close, unfollow, open, re-apply aliases, allow writes. Returns True on success."""
     if dry_run:
-        logging.info(f"[DRY RUN] Would promote index {index} to leader")
-        return True  
-    else:
-        for attempt in range(retries):
-            try:
-                # Pause CCR
-                es.ccr.pause_follow(index=index)
-                logging.info(f"Paused CCR for index {index}")
+        logger.info("[DRY RUN] Would promote index: %s", index)
+        return True
 
-                # Get alias information
-                alias_info = es.indices.get_alias(index=index)
-                alias_info_dict = alias_info.body  # Use .body to get the JSON response as a dictionary
-                logging.info(f"Alias info for index {index}: {json.dumps(alias_info_dict, indent=2)}")
+    for attempt in range(PROMOTE_RETRIES):
+        try:
+            es.ccr.pause_follow(index=index)
+            logger.info("Paused CCR for %s", index)
 
-                # Close the index
-                es.indices.close(index=index)
-                logging.info(f"Closed index {index}")
+            alias_resp = es.indices.get_alias(index=index)
+            alias_body = alias_resp.body if hasattr(alias_resp, "body") else alias_resp
+            alias_data = alias_body.get(index, {}).get("aliases", {})
 
-                # Unfollow the leader
-                es.ccr.unfollow(index=index)
-                logging.info(f"Unfollowed index {index}")
+            es.indices.close(index=index)
+            logger.info("Closed index %s", index)
 
-                # Open the index
-                es.indices.open(index=index)
-                logging.info(f"Opened index {index}")
+            es.ccr.unfollow(index=index)
+            logger.info("Unfollowed %s", index)
 
-                # Reapply alias information
-                for alias, alias_data in alias_info_dict.get(index, {}).get('aliases', {}).items():
-                    es.indices.put_alias(index=index, name=alias, body=alias_data)
-                    logging.info(f"Reapplied alias {alias} for index {index} with data {alias_data}")
+            es.indices.open(index=index)
+            logger.info("Opened index %s", index)
 
-                # Allow writes
-                es.indices.put_settings(index=index, body={"index.blocks.write": False})
-                logging.info(f"Allowed writes for index {index}")
+            for alias, meta in alias_data.items():
+                es.indices.put_alias(index=index, name=alias, body=meta or {})
+                logger.info("Reapplied alias %s for %s", alias, index)
 
-                return True
-            except exceptions.ConnectionError as e:
-                logging.error(f"Connection error: {e}")
-            except exceptions.NotFoundError as e:
-                logging.error(f"Not found error: {e}")
-            except exceptions.RequestError as e:
-                logging.error(f"Request error: {e}")
-            except Exception as e:
-                logging.error(f"Attempt {attempt + 1}/{retries}: Error promoting index {index}: {e}")
-                if attempt < retries - 1: 
-                    time.sleep(delay)
-        return False
+            es.indices.put_settings(index=index, body={"index.blocks.write": False})
+            logger.info("Allowed writes for %s", index)
+            return True
+
+        except (exceptions.ConnectionError, exceptions.NotFoundError, exceptions.RequestError) as e:
+            logger.error("Attempt %d for %s: %s", attempt + 1, index, e)
+        except Exception as e:
+            logger.error("Attempt %d for %s: %s", attempt + 1, index, e)
+        if attempt < PROMOTE_RETRIES - 1:
+            time.sleep(PROMOTE_DELAY)
+    return False
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Promote CCR follower indices to leaders (cutover).",
+    )
+    parser.add_argument(
+        "config",
+        nargs="?",
+        default="config.json",
+        help="Path to config JSON (default: config.json)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only log what would be done",
+    )
+    parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Skip confirmation prompts (use in automation)",
+    )
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    dry_run = args.dry_run or config.get("dry_run", False)
+    es_url = config.get("es_src_url")
+    api_key = config.get("api_key")
+    if not es_url or not api_key:
+        logger.error("Config must include es_src_url and api_key.")
+        sys.exit(1)
+
+    es = Elasticsearch([es_url], api_key=api_key)
+
+    if dry_run:
+        logger.info("Running in DRY_RUN mode")
+
+    follower_indices = get_follower_indices(es)
+    if not follower_indices:
+        logger.info("No follower indices found. Exiting.")
+        return
+
+    logger.info("Follower indices: %s", follower_indices)
+
+    caught_up, not_caught_up = validate_follower_indices(es, follower_indices)
+
+    if not caught_up and not not_caught_up:
+        logger.info("No follower index info from follow_info. Exiting.")
+        return
+
+    if not_caught_up:
+        logger.warning("Not caught up (will not be promoted): %s", not_caught_up)
+    if caught_up:
+        logger.info("Caught up (will be promoted): %s", caught_up)
+
+    if not caught_up:
+        logger.info("No indices are caught up. Nothing to promote. Exiting.")
+        return
+
+    if not args.yes:
+        if not_caught_up:
+            msg = (
+                f"Only {len(caught_up)} index/indices are caught up; {len(not_caught_up)} are not. "
+                "Promote only the caught-up ones? (yes/no): "
+            )
+        else:
+            msg = "Proceed with promotion? (yes/no): "
+        try:
+            reply = input(msg).strip().lower()
+        except EOFError:
+            reply = "no"
+        if reply != "yes":
+            logger.info("Promotion cancelled.")
+            return
+
+        if not dry_run:
+            reply2 = input("Final confirmation — proceed with promotion? (yes/no): ").strip().lower()
+            if reply2 != "yes":
+                logger.info("Promotion cancelled.")
+                return
+
+    failed = []
+    for index in caught_up:
+        if not promote_follower(es, index, dry_run):
+            failed.append(index)
+            logger.error("Failed to promote %s after %d attempts", index, PROMOTE_RETRIES)
+
+    logger.info("Promoted %d index/indices.", len(caught_up) - len(failed))
+    if failed:
+        logger.error("Failed: %s", failed)
+        sys.exit(1)
+
 
 if __name__ == "__main__":
-    follower_indices = get_follower_indices()
-    
-    if not follower_indices:
-        logging.info("No follower indices found. Exiting.")
-        exit()
-
-    logging.info(f"Follower indices found: {follower_indices}")
-
-    caught_up_indices, not_caught_up_indices = validate_follower_indices(follower_indices)
-
-    if not caught_up_indices and not not_caught_up_indices:
-        logging.info("No follower indices found. Exiting.")
-        exit()
-
-    if not_caught_up_indices:
-        logging.info(f"Indices not caught up: {not_caught_up_indices}")
-        if dry_run:
-            logging.info("[DRY RUN] Would prompt for proceeding despite some indices not being caught up.")
-        else:
-            proceed = input("Follower indices are not caught up yet. Do you still wish to proceed? (yes/no): ").lower()
-            if proceed != "yes":
-                logging.info("Promotion cancelled due to indices not being caught up.")
-                exit()
-    else:
-        logging.info("All follower indices are caught up.")
-        if dry_run:
-            logging.info("[DRY RUN] Would prompt for proceeding with promotion.")
-        else:
-            proceed = input("Do you want to proceed with promotion? (yes/no): ").lower()
-            if proceed != "yes":
-                logging.info("Promotion cancelled.")
-                exit()
-
-    logging.info(f"Total number of follower indices found: {len(follower_indices)}")
-    logging.info(f"Follower indices to be promoted:\n{json.dumps(follower_indices, indent=2)}")
-    
-    if not dry_run:
-        confirmation = input("Proceed with promotion (yes/no)? ").lower()
-        if confirmation != "yes":
-            logging.info("Promotion cancelled.")
-            exit()
-
-    # Promote each follower index (only if not dry run)
-    for index in caught_up_indices:
-        if not promote_follower(index):
-            logging.error(f"Failed to promote index {index} after multiple attempts.")
-    
-    logging.info(f"Total number of follower indices promoted: {len(caught_up_indices)}")
+    main()

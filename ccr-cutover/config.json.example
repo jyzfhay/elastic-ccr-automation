@@ -1,0 +1,5 @@
+{
+  "es_src_url": "https://your-follower-cluster.es.us-central1.gcp.cloud.es.io:9243",
+  "api_key": "your-api-key-with-ccr-and-index-management",
+  "dry_run": true
+}

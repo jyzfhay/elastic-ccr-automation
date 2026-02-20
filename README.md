@@ -1,28 +1,82 @@
-# Elasticsearch Cross-Cluster Replication Setup
+# Elasticsearch Cross-Cluster Replication (CCR) Automation
 
-This repository contains Python scripts to automate the setup and promotion of Elasticsearch cross-cluster replication (CCR). The repository includes two primary scripts:
+Python scripts to automate CCR setup and cutover for Elasticsearch:
 
-1. **CCR Bootstrap Script**: Automates the initial setup of CCR between leader and follower clusters.
-2. **CCR Cutover Script**: Promotes follower indices to leader indices once they have caught up.
+| Script | Purpose |
+|--------|--------|
+| **ccr_bootstrap** | Create follow tasks on the follower cluster for leader indices that are not yet followed. |
+| **ccr-cutover** | Promote follower indices to standalone leaders (pause follow → unfollow → open → allow writes). |
 
 ## Features
 
-- **Unified Configuration**: Manage configurations for both leader and follower clusters with a single JSON file.
-- **Error Handling**: Enhanced error logging and retries for robustness.
-- **Concurrency**: Uses `ThreadPoolExecutor` for concurrent API requests to speed up the replication setup.
-- **Security**: Secure handling of sensitive information like API keys.
+- **Unified config**: Single JSON file per script for cluster URLs and API keys.
+- **Safety**: `--dry-run` and optional confirmations; cutover supports `--yes` for automation.
+- **Robustness**: Retries and backoff for API calls; concurrent bootstrap requests.
+- **Security**: Keep credentials in `config.json` and add it to `.gitignore` (use `config.json.example` as a template).
 
 ## Requirements
 
-- Python 3.6 or higher
-- `requests` library for the bootstrap script
-- `elasticsearch` library for the cutover script
+- Python 3.6+
+- **ccr_bootstrap**: `requests`
+- **ccr-cutover**: `elasticsearch` (official Elasticsearch Python client)
 
 ## Installation
 
-To get started, clone this repository and install the required Python packages:
+Each script has its own directory and requirements:
 
 ```bash
-git clone 
-cd your-repository-directory
+# Bootstrap (create follow tasks)
+cd ccr_bootstrap
 pip install -r requirements.txt
+
+# Cutover (promote followers to leaders)
+cd ccr-cutover
+pip install -r requirements.txt
+```
+
+## Usage
+
+### 1. CCR Bootstrap
+
+Creates CCR follow tasks for every open leader index that is not yet followed.
+
+```bash
+cd ccr_bootstrap
+cp config.json.example config.json
+# Edit config.json: leader/follower URLs and API keys, rc_name (remote cluster name on follower)
+
+python ccr_bootstrap.py config.json
+# Or with defaults (config.json in current dir):
+python ccr_bootstrap.py
+
+# Dry run (no API writes):
+python ccr_bootstrap.py --dry-run
+```
+
+**Config:** `config.json` must include `leader`, `follower`, and `rc_name`. See `ccr_bootstrap/readme.md` and `config.json.example`.
+
+### 2. CCR Cutover
+
+Promotes follower indices to leaders (pause follow, close, unfollow, open, re-apply aliases, allow writes). Only promotes indices that are **caught up** with the leader.
+
+```bash
+cd ccr-cutover
+cp config.json.example config.json
+# Edit config.json: es_src_url (follower cluster URL), api_key
+
+python ccr-cutover.py config.json
+# Or:
+python ccr-cutover.py
+
+# Dry run:
+python ccr-cutover.py --dry-run
+
+# Non-interactive (e.g. CI):
+python ccr-cutover.py --yes
+```
+
+**Config:** `config.json` must include `es_src_url` (follower cluster) and `api_key`. See `ccr-cutover/readme.md` and `config.json.example`.
+
+## License
+
+See [LICENSE](LICENSE).
